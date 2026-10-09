@@ -1,0 +1,131 @@
+name: Desktop release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Private source release tag (for example v0.2.1)
+        required: true
+        default: v0.2.1
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bundles: nsis
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            bundles: app,dmg
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            bundles: app,dmg
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: hossein26/Madrese
+          ref: ${{ inputs.tag }}
+          token: ${{ secrets.SOURCE_READ_TOKEN }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install dependencies without publishing private build output
+        shell: bash
+        run: |
+          if ! npm ci > "$RUNNER_TEMP/dependencies.log" 2>&1; then
+            echo "::error::Dependency installation failed; private logs are not published."
+            exit 1
+          fi
+      - name: Build signed installer and update package
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        shell: bash
+        run: |
+          if ! npm run tauri build -- --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} > "$RUNNER_TEMP/build.log" 2>&1; then
+            echo "::error::Build failed; private source diagnostics are not published."
+            exit 1
+          fi
+      - name: Name update packages by architecture
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          ARCH="${{ matrix.target }}"
+          DIR="src-tauri/target/$ARCH/release/bundle/macos"
+          mv "$DIR/TeacherLibrary.app.tar.gz" "$DIR/TeacherLibrary_${VERSION}_${ARCH}.app.tar.gz"
+          mv "$DIR/TeacherLibrary.app.tar.gz.sig" "$DIR/TeacherLibrary_${VERSION}_${ARCH}.app.tar.gz.sig"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            src-tauri/target/${{ matrix.target }}/release/bundle/**/*.exe
+            src-tauri/target/${{ matrix.target }}/release/bundle/**/*.exe.sig
+            src-tauri/target/${{ matrix.target }}/release/bundle/**/*.dmg
+            src-tauri/target/${{ matrix.target }}/release/bundle/**/*.app.tar.gz
+            src-tauri/target/${{ matrix.target }}/release/bundle/**/*.app.tar.gz.sig
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      RELEASE_REPOSITORY: hossein26/Madrese-releases
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: hossein26/Madrese
+          ref: ${{ inputs.tag }}
+          token: ${{ secrets.SOURCE_READ_TOKEN }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release-assets
+      - name: Prepare complete updater manifest
+        run: python3 scripts/release-manifest.py release-assets "$RELEASE_REPOSITORY"
+      - name: Publish all platforms together
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION=$(node -p "require('./package.json').version")
+          TAG="v$VERSION"
+          if [[ "${{ inputs.tag }}" != "$TAG" ]]; then
+            echo "Release tag must match the application version" >&2
+            exit 1
+          fi
+          mapfile -d '' FILES < <(find release-assets -type f -print0)
+          publish_release() {
+            local destination="$1"
+            shift
+            if gh release view "$TAG" --repo "$destination" >/dev/null 2>&1; then
+              gh release upload "$TAG" "${FILES[@]}" --repo "$destination" --clobber
+              gh release edit "$TAG" --repo "$destination" --title "Madrese $VERSION" --notes-file RELEASE_NOTES.md
+            else
+              gh release create "$TAG" "${FILES[@]}" --repo "$destination" --draft --title "Madrese $VERSION" --notes-file RELEASE_NOTES.md "$@"
+            fi
+            gh release edit "$TAG" --repo "$destination" --draft=false --latest
+          }
+          publish_release "$RELEASE_REPOSITORY"
